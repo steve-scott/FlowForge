@@ -32,6 +32,7 @@ import base64
 import zlib
 import gzip
 import re
+import html
 import logging
 import binascii
 from urllib.parse import unquote
@@ -70,6 +71,36 @@ def parse_style(style_str):
                 if token:
                     style_dict[token] = True
     return style_dict
+
+
+def clean_label(label, is_html=False):
+    """
+    Convert a Draw.io label into text that is safe inside a quoted Mermaid label.
+
+    When the cell style has html=1, Draw.io stores the label as HTML markup
+    (e.g. '<font color="#ff0000">Start</font>'). Formatting tags are stripped,
+    line breaks (<br>, <div>, <p>, newlines) are joined with a single space,
+    and HTML entities are decoded. Characters that would break Mermaid syntax are
+    then escaped using Mermaid entity codes.
+
+    :param label: Raw label string from a Draw.io cell's "value" attribute.
+    :param is_html: True if the cell's style has html=1.
+    :return: Cleaned label string.
+    """
+    if not label:
+        return ""
+    text = label
+    if is_html:
+        text = re.sub(r'<\s*br\s*/?\s*>', '\n', text, flags=re.IGNORECASE)
+        text = re.sub(r'<\s*/?\s*(div|p)\b[^>]*>', '\n', text, flags=re.IGNORECASE)
+        text = re.sub(r'<[^>]*>', '', text)
+        text = html.unescape(text)
+    text = text.replace('\xa0', ' ')
+    text = re.sub(r'\s+', ' ', text).strip()
+    return (text.replace('#', '#35;')
+                .replace('"', '#quot;')
+                .replace('<', '#lt;')
+                .replace('>', '#gt;'))
 
 
 # --- Main Converter Class ---
@@ -132,12 +163,7 @@ class FlowForgeConverter:
 
         Populates self.diagram_pages with decompressed XML strings.
         """
-        if "<mxGraphModel" in xml_data:
-            self.logger.debug("Found uncompressed <mxGraphModel> tag directly in the file.")
-            self.diagram_pages.append(xml_data)
-            return
-
-        # Handle compressed data
+        # Split into pages first; each page may be compressed or plain XML.
         diagrams = re.findall(r"<diagram[^>]*>(.*?)</diagram>", xml_data, re.DOTALL)
         
         if not diagrams:
@@ -236,6 +262,9 @@ class FlowForgeConverter:
                             decompressed = zlib.decompress(decoded, wbits)
                         
                         xml_text = decompressed.decode('utf-8', errors='replace')
+                        # draw.io URL-encodes the XML before deflating it.
+                        if "<mxGraphModel" not in xml_text:
+                            xml_text = unquote(xml_text)
                         if "<mxGraphModel" in xml_text:
                             self.diagram_pages.append(xml_text)
                             self.logger.info(f"Successfully decompressed diagram {d_index} using {desc}.")
@@ -252,6 +281,9 @@ class FlowForgeConverter:
                     try:
                         decompressed = gzip.decompress(decoded)
                         xml_text = decompressed.decode('utf-8', errors='replace')
+                        # draw.io URL-encodes the XML before deflating it.
+                        if "<mxGraphModel" not in xml_text:
+                            xml_text = unquote(xml_text)
                         if "<mxGraphModel" in xml_text:
                             self.diagram_pages.append(xml_text)
                             self.logger.info(f"Successfully decompressed diagram {d_index} using gzip.")
@@ -267,6 +299,9 @@ class FlowForgeConverter:
                         inflator = zlib.decompressobj(16 + zlib.MAX_WBITS)
                         decompressed = inflator.decompress(decoded)
                         xml_text = decompressed.decode('utf-8', errors='replace')
+                        # draw.io URL-encodes the XML before deflating it.
+                        if "<mxGraphModel" not in xml_text:
+                            xml_text = unquote(xml_text)
                         if "<mxGraphModel" in xml_text:
                             self.diagram_pages.append(xml_text)
                             self.logger.info(f"Successfully decompressed diagram {d_index} using PAKO variant.")
@@ -401,14 +436,15 @@ class FlowForgeConverter:
                 continue
 
             if cell.get("vertex") == "1":
-                label = cell.get("value") or ""
                 style = cell.get("style") or ""
+                style_dict = parse_style(style)
+                label = clean_label(cell.get("value") or "", style_dict.get("html") == "1")
                 geometry = cell.find("mxGeometry")
                 node = {
                     "id": cell_id,
                     "label": label,
                     "style": style,
-                    "style_dict": parse_style(style),
+                    "style_dict": style_dict,
                     "geometry": geometry.attrib if geometry is not None else {},
                     "parent": cell.get("parent")
                 }
@@ -416,17 +452,31 @@ class FlowForgeConverter:
                 self.node_map[cell_id] = node
 
             elif cell.get("edge") == "1":
+                style = cell.get("style") or ""
+                style_dict = parse_style(style)
                 edge = {
                     "id": cell_id,
                     "source": cell.get("source"),
                     "target": cell.get("target"),
-                    "label": cell.get("value") or "",
-                    "style": cell.get("style") or "",
-                    "style_dict": parse_style(cell.get("style") or "")
+                    "label": clean_label(cell.get("value") or "", style_dict.get("html") == "1"),
+                    "style": style,
+                    "style_dict": style_dict
                 }
                 self.diagram["edges"].append(edge)
             else:
                 self.logger.debug(f"Skipping cell id {cell_id}: not a vertex or edge.")
+
+        # Labels added to an edge in Draw.io are stored as child vertices of that
+        # edge. Merge them into the edge's label instead of emitting stray nodes.
+        edge_map = {edge["id"]: edge for edge in self.diagram["edges"]}
+        for node in list(self.diagram["nodes"]):
+            edge = edge_map.get(node.get("parent"))
+            if edge is None:
+                continue
+            if node["label"]:
+                edge["label"] = " ".join(l for l in (edge["label"], node["label"]) if l)
+            self.diagram["nodes"].remove(node)
+            del self.node_map[node["id"]]
 
         self.logger.info("Built diagram: %d nodes, %d edges.",
                          len(self.diagram["nodes"]), len(self.diagram["edges"]))
@@ -458,10 +508,10 @@ class FlowForgeConverter:
         node_id = "N" + node["id"]
 
         shape = style.get("shape", "").lower()
-        if shape == "rhombus":
+        if shape in ("rhombus", "mxgraph.flowchart.decision") or "rhombus" in style:
             node_def = f'{node_id}{{"{label}"}}'
         elif shape == "ellipse" or "ellipse" in style:
-            node_def = f'{node_id}(( "{label}" ))'
+            node_def = f'{node_id}(("{label}"))'
         elif style.get("rounded") == "1" or shape == "stadium":
             node_def = f'{node_id}("{label}")'
         else:
@@ -480,14 +530,15 @@ class FlowForgeConverter:
         label = edge["label"].strip()
         style = edge["style_dict"]
 
-        arrow = "-->"
-        if style.get("dashed") or style.get("dashed") == "1":
-            arrow = "-.->"
-        if style.get("endArrow") == "none":
-            arrow = arrow.replace("->", "-")
+        dashed = style.get("dashed") in ("1", True)
+        no_arrowhead = style.get("endArrow") == "none"
+        if dashed:
+            arrow = "-.-" if no_arrowhead else "-.->"
+        else:
+            arrow = "---" if no_arrowhead else "-->"
 
         if label:
-            edge_def = f'{src} -- "{label}" {arrow} {tgt}'
+            edge_def = f'{src} {arrow}|"{label}"| {tgt}'
         else:
             edge_def = f'{src} {arrow} {tgt}'
         return edge_def
@@ -504,7 +555,8 @@ class FlowForgeConverter:
         """
         indent = "    " * indent_level
         lines = []
-        lines.append(f"{indent}subgraph {group_id}[{group['label']}]")
+        label = group["label"]
+        lines.append(f'{indent}subgraph N{group_id}["{label}"]')
         for child in group.get("children", []):
             child_id = child["id"]
             if child_id in self.diagram["groups"]:
@@ -536,16 +588,22 @@ class FlowForgeConverter:
             self.logger.warning(f"Diagram type '{diagram_type}' not fully supported. Defaulting to flowchart.")
             lines.append(f"flowchart {direction}")
 
-        nodes_emitted = set()
+        groups = diagram.get("groups", {})
+        # Group nodes are emitted as subgraphs, never as plain nodes.
+        nodes_emitted = set(groups)
 
-        for group_id, group in diagram.get("groups", {}).items():
+        for group_id, group in groups.items():
+            # Nested groups are emitted by their parent's subgraph.
+            if self.node_map[group_id].get("parent") in groups:
+                continue
             try:
                 group_lines = self._emit_subgraph_recursive(group_id, group, indent_level=0)
                 lines.extend(group_lines)
-                for child in group.get("children", []):
-                    nodes_emitted.add(child["id"])
             except Exception as e:
                 self.logger.warning(f"Error emitting subgraph for group {group_id}: {str(e)}")
+        for group in groups.values():
+            for child in group.get("children", []):
+                nodes_emitted.add(child["id"])
 
         for node in diagram.get("nodes", []):
             if node["id"] not in nodes_emitted:
