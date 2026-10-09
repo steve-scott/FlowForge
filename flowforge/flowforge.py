@@ -104,6 +104,53 @@ def clean_label(label, is_html=False):
                 .replace('>', '#gt;'))
 
 
+# Draw.io "shape=" values mapped to Mermaid node shapes. Each entry is the
+# (opening, closing) bracket pair placed around the quoted label.
+SHAPE_BRACKETS = {
+    "rhombus": ("{", "}"),
+    "mxgraph.flowchart.decision": ("{", "}"),
+    "hexagon": ("{{", "}}"),
+    "mxgraph.flowchart.preparation": ("{{", "}}"),
+    "cylinder": ("[(", ")]"),
+    "cylinder3": ("[(", ")]"),
+    "datastore": ("[(", ")]"),
+    "mxgraph.flowchart.database": ("[(", ")]"),
+    "mxgraph.flowchart.stored_data": ("[(", ")]"),
+    "parallelogram": ("[/", "/]"),
+    "mxgraph.flowchart.data": ("[/", "/]"),
+    "trapezoid": ("[/", "\\]"),
+    "mxgraph.flowchart.manual_operation": ("[\\", "/]"),
+    "process": ("[[", "]]"),
+    "mxgraph.flowchart.predefined_process": ("[[", "]]"),
+    "mxgraph.flowchart.terminator": ("([", "])"),
+    "doubleellipse": ("(((", ")))"),
+    "ellipse": ("((", "))"),
+    "mxgraph.flowchart.start_1": ("((", "))"),
+    "mxgraph.flowchart.start_2": ("((", "))"),
+}
+
+# Style flags (style keys without a value) mapped to Mermaid node shapes. Only
+# used when the style has no "shape=" entry; e.g. clouds are "ellipse;shape=cloud".
+FLAG_BRACKETS = {
+    "rhombus": ("{", "}"),
+    "ellipse": ("((", "))"),
+}
+
+# Draw.io "shape=" values that are drawn as rectangles, so mapping them to a Mermaid
+# rectangle loses nothing. Any other unmapped shape (and the "triangle" style flag)
+# is reported as simplified.
+RECTANGLE_SHAPES = {"rect", "rectangle", "label", "mxgraph.flowchart.process"}
+
+# Draw.io arrowhead styles and the Mermaid marker each maps to. Any other style
+# (diamond, ER notation, half circle, ...) is drawn as a normal arrow and reported.
+ARROW_MARKERS = {
+    "none": "",
+    "classic": ">", "classicThin": ">", "block": ">", "blockThin": ">",
+    "open": ">", "openThin": ">",
+    "oval": "o", "ovalThin": "o", "circle": "o", "circlePlus": "o",
+    "cross": "x",
+}
+
 # Words that cannot be used as Mermaid flowchart node IDs.
 MERMAID_RESERVED_IDS = {
     "end", "graph", "flowchart", "subgraph", "direction", "style", "class",
@@ -159,6 +206,8 @@ class FlowForgeConverter:
         self.diagram = {"nodes": [], "edges": [], "groups": {}}
         self.diagram_pages = []
         self.mermaid_ids = {}
+        self.skipped_ids = set()
+        self.simplified = {"shapes": set(), "edges": set()}
 
     # --- File and Data Loading Methods ---
     def load_file(self, file_path):
@@ -491,6 +540,20 @@ class FlowForgeConverter:
             else:
                 self.logger.debug(f"Skipping cell id {cell_id}: not a vertex or edge.")
 
+        # Cells with custom properties (Edit Data), links or tooltips are wrapped in
+        # <object> or <UserObject> elements. These are not supported yet.
+        self.skipped_ids = set()
+        for wrapper in diagram_root:
+            if wrapper.tag not in ("object", "UserObject"):
+                continue
+            wrapper_id = wrapper.get("id")
+            self.skipped_ids.add(wrapper_id)
+            label = clean_label(wrapper.get("label") or "", True)
+            self.logger.warning(
+                f"Skipping shape '{label}' (id {wrapper_id}): shapes with custom properties, "
+                "links or tooltips are not supported."
+            )
+
         # Labels added to an edge in Draw.io are stored as child vertices of that
         # edge. Merge them into the edge's label instead of emitting stray nodes.
         edge_map = {edge["id"]: edge for edge in self.diagram["edges"]}
@@ -510,10 +573,11 @@ class FlowForgeConverter:
             parent = node.get("parent")
             if parent and parent in self.node_map:
                 parent_style = self.node_map[parent].get("style", "")
-                if "group" in parent_style or "swimlane" in parent_style:
+                is_container = self.node_map[parent]["style_dict"].get("container") == "1"
+                if is_container or "group" in parent_style or "swimlane" in parent_style:
                     if parent not in self.diagram["groups"]:
                         self.diagram["groups"][parent] = {
-                            "label": self.node_map[parent].get("label") or f"Group_{parent}",
+                            "label": self.node_map[parent].get("label") or " ",
                             "children": []
                         }
                     self.diagram["groups"][parent]["children"].append(node)
@@ -540,7 +604,7 @@ class FlowForgeConverter:
         nodes = diagram.get("nodes", [])
         base = {}
         for node in nodes:
-            slug = slugify(node["label"]) or "node"
+            slug = slugify(node["label"]) or ("group" if node["id"] in diagram.get("groups", {}) else "node")
             if slug[0].isdigit():
                 slug = "n_" + slug
             if slug in MERMAID_RESERVED_IDS:
@@ -605,15 +669,23 @@ class FlowForgeConverter:
         node_id = self._mermaid_id(node["id"])
 
         shape = style.get("shape", "").lower()
-        if shape in ("rhombus", "mxgraph.flowchart.decision") or "rhombus" in style:
-            node_def = f'{node_id}{{"{label}"}}'
-        elif shape == "ellipse" or "ellipse" in style:
-            node_def = f'{node_id}(("{label}"))'
-        elif style.get("rounded") == "1" or shape == "stadium":
-            node_def = f'{node_id}("{label}")'
+        flag = None if shape else next((f for f in FLAG_BRACKETS if f in style), None)
+        if shape in SHAPE_BRACKETS:
+            opening, closing = SHAPE_BRACKETS[shape]
+        elif flag:
+            opening, closing = FLAG_BRACKETS[flag]
+        elif style.get("rounded") == "1":
+            opening, closing = "(", ")"
         else:
-            node_def = f'{node_id}["{label}"]'
-        return node_def
+            opening, closing = "[", "]"
+            if shape:
+                unmapped = None if shape in RECTANGLE_SHAPES else shape
+            else:
+                unmapped = "triangle" if "triangle" in style else None
+            if unmapped:
+                self._note_simplified("shapes", node["id"], f"shape '{label}'",
+                                      f"draw.io shape '{unmapped}' has no Mermaid equivalent; drawn as a rectangle")
+        return f'{node_id}{opening}"{label}"{closing}'
 
     def _format_edge(self, edge):
         """
@@ -627,18 +699,65 @@ class FlowForgeConverter:
         label = edge["label"].strip()
         style = edge["style_dict"]
 
-        dashed = style.get("dashed") in ("1", True)
-        no_arrowhead = style.get("endArrow") == "none"
-        if dashed:
-            arrow = "-.-" if no_arrowhead else "-.->"
+        source_label = self.node_map[edge["source"]]["label"] or edge["source"]
+        target_label = self.node_map[edge["target"]]["label"] or edge["target"]
+        description = f"edge '{source_label}' -> '{target_label}'"
+
+        # Draw.io draws an arrowhead at the end and none at the start unless told otherwise.
+        end_style = style.get("endArrow", "classic")
+        start_style = style.get("startArrow", "none")
+        for arrow_style in (start_style, end_style):
+            if arrow_style not in ARROW_MARKERS:
+                self._note_simplified("edges", edge["id"], description,
+                                      f"arrowhead '{arrow_style}' has no Mermaid equivalent; drawn as a normal arrow")
+        end = ARROW_MARKERS.get(end_style, ">")
+        start = ARROW_MARKERS.get(start_style, ">")
+        if start and not end:
+            # Arrowhead only at the start: reverse the edge so Mermaid can draw it.
+            src, tgt, start, end = tgt, src, "", start
+        elif start and start != end:
+            # Mermaid can only draw matching markers at both ends.
+            self._note_simplified("edges", edge["id"], description,
+                                  f"different markers at each end ({start_style}, {end_style}); "
+                                  "only the end marker is kept")
+            start = ""
+
+        try:
+            thick = float(style.get("strokeWidth", 1)) >= 3
+        except ValueError:
+            thick = False
+        if style.get("dashed") in ("1", True):
+            line, plain_line = "-.-", "-.-"
+            if thick:
+                self._note_simplified("edges", edge["id"], description,
+                                      "thick dashed line drawn as a normal dashed line (Mermaid has no thick dashed line)")
+        elif thick:
+            line, plain_line = "==", "==="
         else:
-            arrow = "---" if no_arrowhead else "-->"
+            line, plain_line = "--", "---"
+        if end:
+            arrow = {"": "", ">": "<", "o": "o", "x": "x"}[start] + line + end
+        else:
+            arrow = plain_line
 
         if label:
             edge_def = f'{src} {arrow}|"{label}"| {tgt}'
         else:
             edge_def = f'{src} {arrow} {tgt}'
         return edge_def
+
+    def _note_simplified(self, kind, item_id, description, reason):
+        """
+        Records that a shape or edge could not be reproduced exactly in Mermaid.
+        Details are logged at INFO level; _emit_mermaid logs a one-line summary as a warning.
+
+        :param kind: "shapes" or "edges".
+        :param item_id: Draw.io cell ID, so an item with several problems is counted once.
+        :param description: Human-readable name of the item, e.g. "shape 'Treasury'".
+        :param reason: What was simplified.
+        """
+        self.simplified[kind].add(item_id)
+        self.logger.info(f"Simplified {description} (id {item_id}): {reason}")
 
     # --- Emitting Mermaid Syntax ---
     def _emit_subgraph_recursive(self, group_id, group, indent_level=0):
@@ -680,6 +799,7 @@ class FlowForgeConverter:
         :return: Mermaid code as a string.
         """
         self.mermaid_ids = {}
+        self.simplified = {"shapes": set(), "edges": set()}
         if readable_ids:
             self._assign_readable_ids(diagram)
 
@@ -718,12 +838,23 @@ class FlowForgeConverter:
         for edge in diagram.get("edges", []):
             try:
                 if edge["source"] not in self.node_map or edge["target"] not in self.node_map:
-                    self.logger.warning(f"Skipping edge {edge['id']} due to missing endpoints.")
+                    if {edge["source"], edge["target"]} & self.skipped_ids:
+                        self.logger.warning(f"Skipping edge {edge['id']}: it connects to a skipped shape.")
+                    else:
+                        self.logger.warning(f"Skipping edge {edge['id']} due to missing endpoints.")
                     continue
                 edge_def = self._format_edge(edge)
                 lines.append(edge_def)
             except Exception as e:
                 self.logger.warning(f"Error formatting edge {edge['id']}: {str(e)}")
+
+        edge_count, shape_count = len(self.simplified["edges"]), len(self.simplified["shapes"])
+        if edge_count or shape_count:
+            parts = [f"{n} {kind[:-1] if n == 1 else kind}"
+                     for n, kind in ((edge_count, "edges"), (shape_count, "shapes")) if n]
+            verb = "was" if edge_count + shape_count == 1 else "were"
+            self.logger.warning(f"{' and '.join(parts)} {verb} simplified to fit Mermaid; "
+                                "run with -v (or log level INFO) for details.")
 
         return "\n".join(lines)
 
