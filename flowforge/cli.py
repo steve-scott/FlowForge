@@ -69,6 +69,8 @@ def main(argv=None):
                         help="Convert only this diagram page index (default: all pages)")
     parser.add_argument("--direction", default="TD",
                         help="Mermaid flow direction, e.g. TD or LR (default: TD)")
+    parser.add_argument("--drawio-ids", dest="readable_ids", action="store_false",
+                        help="Use Draw.io cell IDs as node IDs instead of IDs made from labels")
     parser.add_argument("--strict", action="store_true",
                         help="Stop on the first conversion error")
     parser.add_argument("-v", "--verbose", action="store_true",
@@ -102,7 +104,8 @@ def main(argv=None):
         sections = []
         for index in page_indices:
             mermaid_code = converter.convert(xml_content, diagram_index=index,
-                                             direction=args.direction)
+                                             direction=args.direction,
+                                             readable_ids=args.readable_ids)
             if not mermaid_code:
                 print(f"Warning: page {index} ({page_names[index]}) produced no output",
                       file=sys.stderr)

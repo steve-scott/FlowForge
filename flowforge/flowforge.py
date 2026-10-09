@@ -33,6 +33,7 @@ import zlib
 import gzip
 import re
 import html
+import unicodedata
 import logging
 import binascii
 from urllib.parse import unquote
@@ -103,6 +104,29 @@ def clean_label(label, is_html=False):
                 .replace('>', '#gt;'))
 
 
+# Words that cannot be used as Mermaid flowchart node IDs.
+MERMAID_RESERVED_IDS = {
+    "end", "graph", "flowchart", "subgraph", "direction", "style", "class",
+    "classdef", "click", "linkstyle", "default", "call", "href",
+}
+
+
+def slugify(label, max_length=40):
+    """
+    Turn a cleaned label into a Mermaid-safe identifier, e.g. "Capacity List" -> "capacity_list".
+
+    :param label: Label as returned by clean_label().
+    :param max_length: Longest slug to produce; longer slugs are cut at a word boundary.
+    :return: Lowercase identifier of letters, digits and underscores, or "" if none remain.
+    """
+    text = re.sub(r'#\w+;', ' ', label)  # drop Mermaid entity codes such as #quot;
+    text = unicodedata.normalize('NFKD', text).encode('ascii', 'ignore').decode('ascii')
+    slug = re.sub(r'[^a-z0-9]+', '_', text.lower()).strip('_')
+    if len(slug) > max_length:
+        slug = slug[:max_length].rsplit('_', 1)[0]
+    return slug
+
+
 # --- Main Converter Class ---
 class FlowForgeConverter:
     """
@@ -134,6 +158,7 @@ class FlowForgeConverter:
         self.node_map = {}
         self.diagram = {"nodes": [], "edges": [], "groups": {}}
         self.diagram_pages = []
+        self.mermaid_ids = {}
 
     # --- File and Data Loading Methods ---
     def load_file(self, file_path):
@@ -495,6 +520,78 @@ class FlowForgeConverter:
         return self.diagram
 
     # --- Node and Edge Formatting ---
+    def _mermaid_id(self, cell_id):
+        """Returns the Mermaid identifier for a Draw.io cell ID."""
+        return self.mermaid_ids.get(cell_id, "N" + cell_id)
+
+    def _assign_readable_ids(self, diagram):
+        """
+        Builds self.mermaid_ids, mapping each node and group to an identifier made
+        from its label instead of the random Draw.io cell ID.
+
+        A label used by only one cell becomes its ID ("Treasury" -> treasury).
+        Repeated labels are prefixed with the enclosing group's ID
+        ("Capacity List" in group "Law" -> law_capacity_list), and any that
+        still clash are numbered in document order (social_stance_list_stance_1, _2, ...).
+        Groups are named before their contents so prefixes match the group IDs.
+
+        :param diagram: Dictionary containing nodes, edges, and groups.
+        """
+        nodes = diagram.get("nodes", [])
+        base = {}
+        for node in nodes:
+            slug = slugify(node["label"]) or "node"
+            if slug[0].isdigit():
+                slug = "n_" + slug
+            if slug in MERMAID_RESERVED_IDS:
+                slug += "_node"
+            base[node["id"]] = slug
+
+        base_counts = {}
+        for slug in base.values():
+            base_counts[slug] = base_counts.get(slug, 0) + 1
+
+        def depth(node_id):
+            level = 0
+            parent = self.node_map[node_id].get("parent")
+            while parent in base:
+                level += 1
+                parent = self.node_map[parent].get("parent")
+            return level
+
+        levels = {}
+        for node in nodes:
+            levels.setdefault(depth(node["id"]), []).append(node["id"])
+
+        self.mermaid_ids = {}
+        taken = set()
+        for level in sorted(levels):
+            candidates = {}
+            for node_id in levels[level]:
+                slug = base[node_id]
+                parent = self.node_map[node_id].get("parent")
+                if base_counts[slug] > 1 and parent in self.mermaid_ids:
+                    slug = f"{self.mermaid_ids[parent]}_{slug}"
+                candidates[node_id] = slug
+            counts = {}
+            for slug in candidates.values():
+                counts[slug] = counts.get(slug, 0) + 1
+            for node_id, slug in candidates.items():
+                if counts[slug] == 1 and slug not in taken:
+                    self.mermaid_ids[node_id] = slug
+                    taken.add(slug)
+            numbers = {}
+            for node_id, slug in candidates.items():
+                if node_id in self.mermaid_ids:
+                    continue
+                while True:
+                    numbers[slug] = numbers.get(slug, 0) + 1
+                    numbered = f"{slug}_{numbers[slug]}"
+                    if numbered not in taken and counts.get(numbered, 0) == 0:
+                        break
+                self.mermaid_ids[node_id] = numbered
+                taken.add(numbered)
+
     def _format_node(self, node):
         """
         Converts a single node from the internal representation to its Mermaid node definition.
@@ -505,7 +602,7 @@ class FlowForgeConverter:
         """
         label = node["label"].strip() if node["label"] else f"Node_{node['id']}"
         style = node["style_dict"]
-        node_id = "N" + node["id"]
+        node_id = self._mermaid_id(node["id"])
 
         shape = style.get("shape", "").lower()
         if shape in ("rhombus", "mxgraph.flowchart.decision") or "rhombus" in style:
@@ -525,8 +622,8 @@ class FlowForgeConverter:
         :param edge: Dictionary representing an edge.
         :return: Mermaid edge definition string.
         """
-        src = "N" + edge["source"]
-        tgt = "N" + edge["target"]
+        src = self._mermaid_id(edge["source"])
+        tgt = self._mermaid_id(edge["target"])
         label = edge["label"].strip()
         style = edge["style_dict"]
 
@@ -556,7 +653,7 @@ class FlowForgeConverter:
         indent = "    " * indent_level
         lines = []
         label = group["label"]
-        lines.append(f'{indent}subgraph N{group_id}["{label}"]')
+        lines.append(f'{indent}subgraph {self._mermaid_id(group_id)}["{label}"]')
         for child in group.get("children", []):
             child_id = child["id"]
             if child_id in self.diagram["groups"]:
@@ -571,7 +668,7 @@ class FlowForgeConverter:
         lines.append(f"{indent}end")
         return lines
 
-    def _emit_mermaid(self, diagram, direction="TD", diagram_type="flowchart"):
+    def _emit_mermaid(self, diagram, direction="TD", diagram_type="flowchart", readable_ids=True):
         """
         Converts the internal diagram representation into Mermaid code.
 
@@ -579,8 +676,13 @@ class FlowForgeConverter:
         :param diagram: Dictionary containing nodes, edges, and groups.
         :param direction: Mermaid flow direction (e.g., TD for top-down, LR for left-right).
         :param diagram_type: Type of Mermaid diagram to emit.
+        :param readable_ids: Use IDs made from labels instead of Draw.io cell IDs.
         :return: Mermaid code as a string.
         """
+        self.mermaid_ids = {}
+        if readable_ids:
+            self._assign_readable_ids(diagram)
+
         lines = []
         if diagram_type == "flowchart":
             lines.append(f"flowchart {direction}")
@@ -626,7 +728,8 @@ class FlowForgeConverter:
         return "\n".join(lines)
 
     # --- Main Conversion Method ---
-    def convert(self, input_data, diagram_index=0, direction="TD", diagram_type="flowchart"):
+    def convert(self, input_data, diagram_index=0, direction="TD", diagram_type="flowchart",
+                readable_ids=True):
         """
         Main method to convert Draw.io XML data to Mermaid code.
 
@@ -634,6 +737,8 @@ class FlowForgeConverter:
         :param diagram_index: Which diagram page to convert (default: 0).
         :param direction: Flow direction for Mermaid (e.g., "TD", "LR").
         :param diagram_type: The type of Mermaid diagram to emit (default: "flowchart").
+        :param readable_ids: Use node IDs made from labels (e.g. capacity_list) instead of
+                             Draw.io cell IDs (default: True).
         :return: Mermaid code as a string.
         :raises Exception: In strict mode, conversion errors will propagate.
         """
@@ -662,7 +767,8 @@ class FlowForgeConverter:
             if root is None:
                 return ""
             diagram = self._build_diagram_from_root(root)
-            mermaid_code = self._emit_mermaid(diagram, direction=direction, diagram_type=diagram_type)
+            mermaid_code = self._emit_mermaid(diagram, direction=direction, diagram_type=diagram_type,
+                                              readable_ids=readable_ids)
             self.logger.info("Conversion completed successfully.")
             return mermaid_code
         except Exception as e:

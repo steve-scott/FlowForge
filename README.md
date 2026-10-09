@@ -86,6 +86,7 @@ If no extension is given, `.drawio` is assumed. All diagram pages are converted,
 - `-o, --output`: output path (default: the input name with a `.md` extension)
 - `--index N`: convert only page `N`
 - `--direction TD|LR|...`: Mermaid flow direction (default: `TD`)
+- `--drawio-ids`: use Draw.io's cell IDs as node IDs (`N65PPJ_XJzwb0lOGMphRH-12`). By default, IDs are built from labels (`law_capacity_list`); repeated labels are prefixed with their group's ID, then numbered if still ambiguous.
 - `--strict`: stop on the first conversion error
 - `-v, --verbose`: show detailed conversion logging
 
