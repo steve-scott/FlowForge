@@ -72,6 +72,25 @@ Alternatively, if you want to install FlowForge from the source:
 
 ## Usage
 
+### Command Line
+
+Convert a Draw.io file to a Markdown file containing Mermaid code blocks:
+
+```bash
+python -m flowforge diagram            # reads diagram.drawio, writes diagram.md
+flowforge diagram.drawio -o out.md     # same, when installed with pip
+```
+
+If no extension is given, `.drawio` is assumed. All diagram pages are converted, each under its own heading. Options:
+
+- `-o, --output`: output path (default: the input name with a `.md` extension)
+- `--index N`: convert only page `N`
+- `--direction TD|LR|...`: Mermaid flow direction (default: `TD`)
+- `--strict`: stop on the first conversion error
+- `-v, --verbose`: show detailed conversion logging
+
+### Python API
+
 Below is an example of how to use FlowForge in your Python code:
 
 ```python
